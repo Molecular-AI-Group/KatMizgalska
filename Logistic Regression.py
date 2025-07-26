@@ -56,6 +56,8 @@ y = data['resistance']
 
 # Run the process 10 times, initialize a list to store results
 results = []
+features = original_colnames2[df_selected075.columns]
+coef_list = []
 
 # Create a figure for ROC-AUC curves
 plt.figure(figsize=(10, 8))
@@ -69,6 +71,7 @@ for i in range(10):
     # Initialize and fit the logistic regression model
     log_reg = LogisticRegression(max_iter=100, random_state=i)
     log_reg.fit(X_train, y_train)
+    coef_list.append(log_reg.coef_[0])
 
     # Make predictions
     y_pred = log_reg.predict(X_test)
@@ -120,21 +123,19 @@ results_df075 = pd.DataFrame(results)
 print(results_df075[['accuracy', 'precision', 'recall', 'auc', 'specificity']].describe())
 
 # Feature importance extraction
-coefficients = log_reg.coef_[0]  
-features = original_colnames2[df_selected075.columns] 
+coef_array = np.array(coef_list) 
+mean_coef = coef_array.mean(axis=0)
+mean_abs_coef = np.abs(coef_array).mean(axis=0)
 
-# Create a DataFrame for better readability
+#Create importance DataFrame
 importance_df075 = pd.DataFrame({
     'Feature': features,
-    'Coefficient': coefficients,
-    'Importance': np.abs(coefficients)  
+    'MeanCoef': mean_coef,
+    'MeanAbsCoef': mean_abs_coef
 })
 
-# Sort by importance
-importance_df075 = importance_df075.sort_values(by='Importance', ascending=False)
-
-# Get the top 15 features by importance
-top_features = importance_df075.sort_values(by="Importance", ascending=False).head(15)
+# Step 5: Sort by importance and get top 15
+top_features = importance_df075.sort_values(by='MeanAbsCoef', ascending=False).head(15)
 
 # Plot the top 15 features
 plt.figure(figsize=(12, 8))
