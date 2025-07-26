@@ -54,7 +54,7 @@ import numpy as np
 X = df_selected075  
 y = data['resistance']      
 
-# Initialize a list to store results
+# Run the process 10 times, initialize a list to store results
 results = []
 
 # Create a figure for ROC-AUC curves
