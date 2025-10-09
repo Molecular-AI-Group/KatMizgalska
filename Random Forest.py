@@ -37,6 +37,7 @@ for feature in correlation_matrix.columns:
 print("Selected features with pairwise correlations < 0.75:")
 colnames_selected075=original_colnames2[selected_features075]
 df_selected075=data_df[selected_features075]
+print(colnames_selected075)
 
 #3. Random Forest model with default settings
 
