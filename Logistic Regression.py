@@ -121,6 +121,7 @@ plt.show()
 
 # Print the model evaluation results
 results_df075 = pd.DataFrame(results)
+print(results_df075)
 print(results_df075[['accuracy', 'precision', 'recall', 'auc', 'specificity']].describe())
 
 # Feature importance extraction
