@@ -125,8 +125,8 @@ feature_importance_df = pd.DataFrame({
 
 # Print descriptive statistics for selected metrics
 results_df = pd.DataFrame(results)
+print(results_df)
 print(results_df[['Accuracy', 'Precision', 'Recall', 'ROC-AUC', 'Specificity']].describe())
-results_df.to_excel('svm_def.xlsx')
 
 # Get the top 15 features by importance
 top_features = feature_importance_df.sort_values(by="Importance", ascending=False).head(15)
