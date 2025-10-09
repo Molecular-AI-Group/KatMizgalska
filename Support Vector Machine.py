@@ -8,7 +8,7 @@ data = pd.read_excel('KRAS_MD_molecular_descriptors.xlsx')
 original_colnames = data.columns
 
 # Define columns to exclude
-exclude_columns = ['sample', 'resistance', 'frames percentage']
+exclude_columns = ['Sample', 'Resistance', 'Trajectory frames percentage']
 data_to_scale = data.drop(columns=exclude_columns)
 original_colnames2 = data_to_scale.columns
 
@@ -53,7 +53,7 @@ from sklearn.metrics import confusion_matrix
 
 # Define the feature matrix (X) and target variable (y)
 X = df_selected075  
-y = data['resistance'] 
+y = data['Resistance'] 
 
 # Run the process 10 times, initialize a list to store results
 results = []
