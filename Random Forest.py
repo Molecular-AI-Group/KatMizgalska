@@ -127,6 +127,7 @@ feature_importance_df = pd.DataFrame({
 
 # Print descriptive statistics for selected metrics
 results_df = pd.DataFrame(results)
+print(results_df)
 print(results_df[['Accuracy', 'Precision', 'Recall', 'ROC-AUC', 'Specificity']].describe())
 
 # The top 15 features by importance
