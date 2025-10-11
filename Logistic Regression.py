@@ -141,7 +141,7 @@ top_features = importance_df075.sort_values(by='MeanAbsCoef', ascending=False).h
 
 # Plot the top 15 features
 plt.figure(figsize=(12, 8))
-plt.bar(top_features['Feature'], top_features['Importance'], color='skyblue')
+plt.bar(top_features['Feature'], top_features['MeanAbsCoef'], color='skyblue')
 plt.ylabel('Absolute Coefficient Value', fontsize=20)
 plt.xlabel('Feature', fontsize=20)
 plt.title('Top 15 Feature Importance in Logistic Regression', fontsize=24)
