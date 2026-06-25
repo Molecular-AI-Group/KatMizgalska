@@ -1,0 +1,222 @@
+"""
+KRAS Hierarchical (Mixed-Effects) Univariate Analysis
+========================================================
+an analysis that accounts for mutant/replica-level clustering.
+
+Model (per feature):
+    feature ~ Resistance + (1 | System)
+
+  - Fixed effect "Resistance" (0=Sensitive, 1=Resistant): tests whether class
+    differences in the feature hold up after accounting for system-to-system
+    baseline variability.
+  - Random intercept "(1 | System)": allows each of the 6 systems to have its
+    own baseline level for the feature, absorbing system-level correlation
+    among conformers from the same trajectory/mutant.
+
+For each feature, reports:
+  - Fixed-effect coefficient (Resistance) and its p-value
+  - Standardized effect size (coefficient / feature SD) as a Cohen's-d-like
+    measure
+  - Marginal R^2 (variance explained by Resistance) and conditional R^2
+    (variance explained by Resistance + System)
+  - BH-FDR corrected q-values across all features
+
+Systems (6 total, 3 sensitive / 3 resistant):
+  Sensitive: G12C(6oim), G12C(6ut0), G12C(6mbt)
+  Resistant: G12C/Y96C,  G12C/Y96D,  G12C/Y96S
+
+Encoding: Resistance, 0 = Sensitive, 1 = Resistant
+"""
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import warnings
+warnings.filterwarnings('ignore')
+
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+from statsmodels.stats.multitest import multipletests
+
+# =============================================================================
+# 1. LOAD DATA AND EXTRACT SYSTEM LABELS
+# =============================================================================
+
+data = pd.read_excel('KRAS_MD_molecular_descriptors.xlsx')
+
+def extract_system(sample_name):
+    return str(sample_name).split(' ')[0]
+
+data['System'] = data['Sample'].apply(extract_system)
+import re
+
+# Clean numeric columns that were read as strings due to non-breaking
+# spaces or stray whitespace (e.g. from copy-pasted Excel data)
+exclude_columns = ['Sample', 'Resistance', 'Trajectory frames percentage', 'System']
+feature_cols = [c for c in data.columns if c not in exclude_columns]
+
+for c in feature_cols:
+    if data[c].dtype == object:
+        data[c] = (data[c]
+                   .astype(str)
+                   .str.replace('\xa0', '', regex=False)  # non-breaking space
+                   .str.strip())
+        data[c] = pd.to_numeric(data[c], errors='coerce')
+
+print("Conformer counts per system:")
+print(data.groupby(['System', 'Resistance']).size().to_string())
+print()
+
+exclude_columns = ['Sample', 'Resistance', 'Trajectory frames percentage', 'System']
+feature_cols = [c for c in data.columns if c not in exclude_columns]
+print(f"Testing {len(feature_cols)} features with LMM: feature ~ Resistance + (1|System)\n")
+
+# Clean column names for formula compatibility (statsmodels formulas dislike
+# spaces, parentheses, etc. in variable names) — use a safe alias mapping
+safe_names = {feat: f"feat_{i}" for i, feat in enumerate(feature_cols)}
+
+# =============================================================================
+# 2. FIT LMM PER FEATURE
+# =============================================================================
+
+results = []
+
+for feat in feature_cols:
+    alias = safe_names[feat]
+    df_temp = pd.DataFrame({
+        alias: data[feat].values,
+        'Resistance': data['Resistance'].values,
+        'System': data['System'].values
+    })
+
+    # Standardize the feature for a Cohen's-d-like effect size
+    feat_std = df_temp[alias].std()
+    if feat_std == 0 or np.isnan(feat_std):
+        # Constant feature — skip
+        results.append({
+            'Feature': feat, 'Coef_Resistance': np.nan, 'StdEffect': np.nan,
+            'SE': np.nan, 'P_value': np.nan, 'Converged': False,
+            'Marginal_R2': np.nan, 'Conditional_R2': np.nan,
+            'ICC_System': np.nan, 'Note': 'Zero variance feature'
+        })
+        continue
+
+    try:
+        model = smf.mixedlm(f"{alias} ~ Resistance", df_temp, groups=df_temp['System'])
+        fit = model.fit(reml=True, method='lbfgs')
+
+        coef       = float(fit.params['Resistance'])
+        se         = float(fit.bse['Resistance'])
+        pval       = float(fit.pvalues['Resistance'])
+        std_effect = coef / feat_std  # Cohen's-d-like standardized effect
+
+        # ------------------------------------------------------------
+        # Variance components for R^2 / ICC (Nakagawa & Schielzeth approach)
+        # Extract scalars defensively -- statsmodels return types for
+        # cov_re / fittedvalues / resid can vary across versions.
+        # ------------------------------------------------------------
+
+        # Variance explained by fixed effects: Var(X * beta_fixed)
+        fitted_fixed = fit.model.exog @ fit.fe_params.values
+        var_fixed = float(np.var(np.asarray(fitted_fixed, dtype=float)))
+
+        # Random-effect (System) variance: top-left of cov_re, forced to float
+        cov_re_arr = np.asarray(fit.cov_re, dtype=float)
+        var_random = float(cov_re_arr[0, 0]) if cov_re_arr.size > 0 else 0.0
+
+        # Residual variance
+        var_resid = float(fit.scale)
+
+        # Marginal R^2: variance explained by fixed effects only
+        total_var = var_fixed + var_random + var_resid
+        if total_var > 0:
+            marginal_r2    = var_fixed / total_var
+            conditional_r2 = (var_fixed + var_random) / total_var
+            icc_system     = var_random / total_var
+        else:
+            marginal_r2 = conditional_r2 = icc_system = np.nan
+
+        results.append({
+            'Feature': feat,
+            'Coef_Resistance': coef,
+            'StdEffect': std_effect,
+            'SE': se,
+            'P_value': pval,
+            'Converged': fit.converged,
+            'Marginal_R2': marginal_r2,
+            'Conditional_R2': conditional_r2,
+            'ICC_System': icc_system,
+            'Note': ''
+        })
+
+    except Exception as e:
+        results.append({
+            'Feature': feat, 'Coef_Resistance': np.nan, 'StdEffect': np.nan,
+            'SE': np.nan, 'P_value': np.nan, 'Converged': False,
+            'Marginal_R2': np.nan, 'Conditional_R2': np.nan,
+            'ICC_System': np.nan, 'Note': f'Fit error: {str(e)[:60]}'
+        })
+
+results_df = pd.DataFrame(results)
+
+# =============================================================================
+# 3. MULTIPLE TESTING CORRECTION (BH-FDR)
+# =============================================================================
+
+valid_mask = ~results_df['P_value'].isna()
+_, q_vals, _, _ = multipletests(results_df.loc[valid_mask, 'P_value'], alpha=0.05, method='fdr_bh')
+results_df['Q_value_BH'] = np.nan
+results_df.loc[valid_mask, 'Q_value_BH'] = q_vals
+results_df['Significant_FDR05'] = results_df['Q_value_BH'] < 0.05
+
+n_converged = results_df['Converged'].sum()
+n_significant = results_df['Significant_FDR05'].sum()
+
+print("=" * 90)
+print("RESULTS SUMMARY")
+print("=" * 90)
+print(f"Models converged: {n_converged} / {len(results_df)}")
+print(f"Features significant at FDR<0.05 (LMM, accounting for System random effect): "
+      f"{n_significant} / {len(results_df)}")
+print(f"\nMean ICC (System): {results_df['ICC_System'].mean():.3f}")
+print("  -> Proportion of total variance attributable to system-level clustering,")
+print("     averaged across all features. High ICC = strong non-independence")
+print("     among conformers from the same system, supporting the reviewer's concern.")
+
+# =============================================================================
+# 4. SORT AND DISPLAY TOP FEATURES
+# =============================================================================
+
+results_df = results_df.sort_values('P_value')
+
+print("\nTop 15 features by LMM p-value:")
+top15 = results_df.head(15)
+print(top15[['Feature', 'StdEffect', 'P_value', 'Q_value_BH',
+              'Marginal_R2', 'ICC_System', 'Converged']].to_string(index=False))
+
+results_df.to_excel('KRAS_LMM_results.xlsx', index=False)
+print("\nFull results saved to KRAS_LMM_results.xlsx")
+
+
+# =============================================================================
+# 6. ICC DISTRIBUTION PLOT — illustrates degree of clustering across features
+# =============================================================================
+
+fig, ax = plt.subplots(figsize=(9, 6))
+ax.hist(results_df['ICC_System'].dropna(), bins=25, color='coral',
+        edgecolor='black', alpha=0.75)
+ax.set_xlabel('Intraclass correlation (ICC) — System', fontsize=14)
+ax.set_ylabel('Number of features', fontsize=14)
+ax.set_title('Distribution of System-Level Clustering (ICC) Across Features\n'
+              'High ICC = conformers within a system are highly correlated', fontsize=13)
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig('KRAS_LMM_ICC_distribution.png', dpi=150)
+plt.show()
+
+print("\nDone.")
+print("Output files:")
+print("  KRAS_LMM_results.xlsx")
+print("  KRAS_LMM_vs_permutation_comparison.xlsx (if permutation results available)")
+print("  KRAS_LMM_vs_permutation_comparison.png")
+print("  KRAS_LMM_ICC_distribution.png")
