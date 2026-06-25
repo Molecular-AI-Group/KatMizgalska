@@ -1,0 +1,325 @@
+"""
+KRAS Replica-Level Block-Averaged Analysis
+=============================================
+The block-averaging approach recommended by e.g. Grossfield & Zuckerman 2009 and Knapp et al. 2018) for avoiding pseudo-
+replication when many correlated frames are sampled from few independent trajectories.
+
+Approach:
+  1. For each feature, compute the MEAN value per replica (System x Replica),
+     collapsing ~7 conformers (clusters C1-C7) into a single number.
+     -> 6 systems x 3 replicas = 18 independent replica-level observations
+        (9 sensitive, 9 resistant)
+  2. Test sensitive vs. resistant on these 18 replica-means using:
+       - Mann-Whitney U (naive, on 18 independent units -- no pseudoreplication)
+       - Effect size: rank-biserial correlation (Cliff's delta)
+       - A replica-level permutation test (label-shuffling at the SYSTEM level,
+         keeping all 3 replicas of a system together) for an additional,
+         maximally conservative check 
+  3. Apply Benjamini-Hochberg FDR correction across all features.
+
+This is complementary to the System-level LMM: it operationalizes "replica-level
+clustering" by treating each replica as one independent data point, which
+respects the true experimental design (replicas are independent MD
+trajectories nested within systems).
+
+Systems (6 total, 3 sensitive / 3 resistant), each with 3 replicas (S1-S3):
+  Sensitive: G12C(6oim), G12C(6ut0), G12C(6mbt)
+  Resistant: G12C/Y96C,  G12C/Y96D,  G12C/Y96S
+
+Encoding: Resistance, 0 = Sensitive, 1 = Resistant
+"""
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from itertools import combinations
+from scipy.stats import mannwhitneyu
+from statsmodels.stats.multitest import multipletests
+import warnings
+warnings.filterwarnings('ignore')
+
+# =============================================================================
+# 1. LOAD DATA AND EXTRACT SYSTEM + REPLICA LABELS
+# =============================================================================
+
+data = pd.read_excel('KRAS_MD_molecular_descriptors.xlsx')
+
+def extract_system(sample_name):
+    return str(sample_name).split(' ')[0]
+
+def extract_replica(sample_name):
+    # Sample format: "G12C(6oim) S1 C1" -> second token is "S1"
+    parts = str(sample_name).split(' ')
+    for p in parts:
+        if p.startswith('S') and p[1:].isdigit():
+            return p
+    return None
+
+data['System']  = data['Sample'].apply(extract_system)
+data['Replica'] = data['Sample'].apply(extract_replica)
+
+print("Conformer counts per System x Replica:")
+print(data.groupby(['System', 'Replica', 'Resistance']).size().to_string())
+print()
+
+# =============================================================================
+# 2. CLEAN NUMERIC COLUMNS (strip non-breaking spaces etc.)
+# =============================================================================
+
+exclude_columns = ['Sample', 'Resistance', 'Trajectory frames percentage',
+                    'System', 'Replica']
+feature_cols = [c for c in data.columns if c not in exclude_columns]
+
+for c in feature_cols:
+    if data[c].dtype == object:
+        data[c] = (data[c]
+                   .astype(str)
+                   .str.replace('\xa0', '', regex=False)
+                   .str.strip())
+        data[c] = pd.to_numeric(data[c], errors='coerce')
+
+print(f"Testing {len(feature_cols)} features.\n")
+
+# =============================================================================
+# 3. BLOCK-AVERAGE: MEAN PER (SYSTEM, REPLICA) -> 18 INDEPENDENT UNITS
+# =============================================================================
+
+group_cols = ['System', 'Replica', 'Resistance']
+replica_means = data.groupby(group_cols)[feature_cols].mean().reset_index()
+
+print(f"Replica-level units: {len(replica_means)} "
+      f"(expected 18 = 6 systems x 3 replicas)")
+print(replica_means[['System', 'Replica', 'Resistance']].to_string(index=False))
+print()
+
+y_replica = replica_means['Resistance'].values
+n_sens_replica = (y_replica == 0).sum()
+n_res_replica  = (y_replica == 1).sum()
+print(f"Sensitive replica-units: {n_sens_replica} | Resistant replica-units: {n_res_replica}\n")
+
+# =============================================================================
+# 4. EFFECT SIZE FUNCTION
+# =============================================================================
+
+def rank_biserial_from_u(u_stat, n1, n2):
+    """Rank-biserial correlation from Mann-Whitney U statistic. Range [-1, 1]."""
+    return 1 - (2 * u_stat) / (n1 * n2)
+
+# =============================================================================
+# 5. SYSTEM-LEVEL PERMUTATION PARTITIONS (for replica-mean permutation test)
+#    Same 10 unique partitions as the conformer-level permutation analysis --
+#    permuting at SYSTEM level keeps all 3 replicas of a system together.
+# =============================================================================
+
+all_systems = sorted(replica_means['System'].unique())
+sensitive_systems = sorted(replica_means.loc[replica_means['Resistance'] == 0, 'System'].unique())
+resistant_systems = sorted(replica_means.loc[replica_means['Resistance'] == 1, 'System'].unique())
+
+all_splits = list(combinations(all_systems, len(sensitive_systems)))
+unique_partitions = []
+seen = set()
+for split in all_splits:
+    split_set = frozenset(split)
+    complement = frozenset(all_systems) - split_set
+    if split_set not in seen and complement not in seen:
+        unique_partitions.append(split_set)
+        seen.add(split_set)
+        seen.add(complement)
+
+print(f"Unique system-level partitions for permutation: {len(unique_partitions)}\n")
+
+# =============================================================================
+# 6. TEST EACH FEATURE ON REPLICA-MEANS
+# =============================================================================
+
+results = []
+
+for feat in feature_cols:
+    values = replica_means[feat].values
+    systems_r = replica_means['System'].values
+
+    sens_vals = values[y_replica == 0]
+    res_vals  = values[y_replica == 1]
+
+    if np.isnan(sens_vals).all() or np.isnan(res_vals).all():
+        results.append({
+            'Feature': feat, 'Effect_size_rank_biserial': np.nan,
+            'P_MWU_replica': np.nan, 'P_permutation_replica': np.nan,
+            'N_permutations': 0
+        })
+        continue
+
+    # ---- Mann-Whitney U on 18 replica-means (9 vs 9) ----
+    try:
+        u_obs, p_mwu = mannwhitneyu(sens_vals, res_vals, alternative='two-sided')
+    except ValueError:
+        u_obs, p_mwu = np.nan, np.nan
+
+    n1, n2 = len(sens_vals), len(res_vals)
+    effect_size = rank_biserial_from_u(u_obs, n1, n2) if not np.isnan(u_obs) else np.nan
+
+    # ---- System-level permutation test on replica-means ----
+    null_effects = []
+    for partition in unique_partitions:
+        perm_sens_mask = np.isin(systems_r, list(partition))
+        sens_perm = values[perm_sens_mask]
+        res_perm  = values[~perm_sens_mask]
+
+        if len(sens_perm) == 0 or len(res_perm) == 0:
+            continue
+        try:
+            u_perm, _ = mannwhitneyu(sens_perm, res_perm, alternative='two-sided')
+        except ValueError:
+            continue
+
+        eff_perm = rank_biserial_from_u(u_perm, len(sens_perm), len(res_perm))
+        null_effects.append(eff_perm)
+
+    null_effects = np.array(null_effects)
+    if len(null_effects) > 0 and not np.isnan(effect_size):
+        p_perm = np.mean(np.abs(null_effects) >= np.abs(effect_size))
+        p_perm = max(p_perm, 1.0 / len(null_effects))
+    else:
+        p_perm = np.nan
+
+    results.append({
+        'Feature': feat,
+        'Effect_size_rank_biserial': effect_size,
+        'P_MWU_replica': p_mwu,
+        'P_permutation_replica': p_perm,
+        'N_permutations': len(null_effects)
+    })
+
+results_df = pd.DataFrame(results)
+
+# =============================================================================
+# 7. BENJAMINI-HOCHBERG FDR CORRECTION
+# =============================================================================
+
+valid_mwu = ~results_df['P_MWU_replica'].isna()
+_, q_mwu, _, _ = multipletests(results_df.loc[valid_mwu, 'P_MWU_replica'],
+                                 alpha=0.05, method='fdr_bh')
+results_df['Q_value_MWU_BH'] = np.nan
+results_df.loc[valid_mwu, 'Q_value_MWU_BH'] = q_mwu
+
+valid_perm = ~results_df['P_permutation_replica'].isna()
+_, q_perm, _, _ = multipletests(results_df.loc[valid_perm, 'P_permutation_replica'],
+                                  alpha=0.05, method='fdr_bh')
+results_df['Q_value_permutation_BH'] = np.nan
+results_df.loc[valid_perm, 'Q_value_permutation_BH'] = q_perm
+
+results_df['Significant_MWU_FDR05'] = results_df['Q_value_MWU_BH'] < 0.05
+results_df['Significant_permutation_FDR05'] = results_df['Q_value_permutation_BH'] < 0.05
+
+# =============================================================================
+# 8. SUMMARY
+# =============================================================================
+
+results_df = results_df.sort_values('P_MWU_replica')
+
+n_sig_mwu  = results_df['Significant_MWU_FDR05'].sum()
+n_sig_perm = results_df['Significant_permutation_FDR05'].sum()
+
+print("=" * 90)
+print("REPLICA-LEVEL BLOCK-AVERAGED RESULTS")
+print("=" * 90)
+print(f"Independent units: {len(replica_means)} ({n_sens_replica} sensitive, {n_res_replica} resistant)")
+print(f"Features significant at FDR<0.05 (MWU on replica-means):              {n_sig_mwu} / {len(results_df)}")
+print(f"Features significant at FDR<0.05 (system-level permutation, replica-means): {n_sig_perm} / {len(results_df)}")
+print(f"\nMinimum achievable permutation p-value: {1/len(unique_partitions):.3f} "
+      f"(based on {len(unique_partitions)} unique system partitions)")
+
+print("\nTop 15 features by replica-mean MWU p-value:")
+top15 = results_df.head(15)
+print(top15[['Feature', 'Effect_size_rank_biserial', 'P_MWU_replica',
+              'Q_value_MWU_BH', 'P_permutation_replica',
+              'Q_value_permutation_BH']].to_string(index=False))
+
+results_df.to_excel('KRAS_replica_level_results.xlsx', index=False)
+print("\nFull results saved to KRAS_replica_level_results.xlsx")
+
+# =============================================================================
+# 9. COMPARISON ACROSS ALL THREE LEVELS (conformer / LMM / replica)
+# =============================================================================
+
+try:
+    perm_conformer = pd.read_excel('KRAS_cluster_aware_statistics.xlsx')
+    lmm = pd.read_excel('KRAS_LMM_results.xlsx')
+
+    merged = (results_df[['Feature', 'Effect_size_rank_biserial', 'P_MWU_replica',
+                           'Q_value_MWU_BH', 'Significant_MWU_FDR05']]
+              .merge(perm_conformer[['Feature', 'P_naive_MWU', 'Significant_naive_FDR05',
+                                      'P_cluster_permutation', 'Significant_cluster_FDR05']],
+                     on='Feature')
+              .merge(lmm[['Feature', 'StdEffect', 'P_value', 'Significant_FDR05', 'ICC_System']],
+                     on='Feature'))
+
+    merged = merged.rename(columns={
+        'Significant_naive_FDR05': 'Sig_conformer_naive',
+        'Significant_cluster_FDR05': 'Sig_conformer_permutation',
+        'Significant_FDR05': 'Sig_LMM_system',
+        'Significant_MWU_FDR05': 'Sig_replica_mean'
+    })
+
+    print("\n" + "=" * 90)
+    print("CROSS-METHOD COMPARISON SUMMARY")
+    print("=" * 90)
+    print(f"{'Method':<40}{'N significant (FDR<0.05)':>25}")
+    print(f"{'Naive conformer-level MWU (n=126)':<40}{merged['Sig_conformer_naive'].sum():>25}")
+    print(f"{'System-level permutation (n=6)':<40}{merged['Sig_conformer_permutation'].sum():>25}")
+    print(f"{'LMM, (1|System) (n=6 groups)':<40}{merged['Sig_LMM_system'].sum():>25}")
+    print(f"{'Replica-mean MWU (n=18)':<40}{merged['Sig_replica_mean'].sum():>25}")
+
+    # Features significant in BOTH replica-mean MWU AND LMM
+    both_sig = merged[merged['Sig_replica_mean'] & merged['Sig_LMM_system']]
+    print(f"\nFeatures significant in BOTH replica-mean MWU AND LMM: {len(both_sig)}")
+    if len(both_sig) > 0:
+        print(both_sig[['Feature', 'Effect_size_rank_biserial', 'P_MWU_replica',
+                         'StdEffect', 'P_value', 'ICC_System']].to_string(index=False))
+
+    merged.to_excel('KRAS_all_methods_comparison.xlsx', index=False)
+    print("\nFull cross-method comparison saved to KRAS_all_methods_comparison.xlsx")
+
+except FileNotFoundError as e:
+    print(f"\n(Could not load comparison files: {e})")
+
+# =============================================================================
+# 10. VISUALIZATION
+# =============================================================================
+
+fig, axes = plt.subplots(1, 2, figsize=(15, 6))
+
+# Panel A: Effect size distribution at replica level
+ax = axes[0]
+ax.hist(results_df['Effect_size_rank_biserial'].dropna(), bins=25,
+        color='mediumseagreen', edgecolor='black', alpha=0.75)
+ax.set_xlabel('Effect size (rank-biserial correlation)', fontsize=13)
+ax.set_ylabel('Number of features', fontsize=13)
+ax.set_title('Effect Sizes — Replica-Level (n=18)', fontsize=13)
+ax.axvline(0, color='gray', linestyle='--')
+ax.grid(True, alpha=0.3)
+
+# Panel B: -log10(p) replica-mean MWU vs naive conformer-level MWU
+ax = axes[1]
+if 'merged' in dir():
+    ax.scatter(-np.log10(merged['P_naive_MWU'].clip(lower=1e-300)),
+               -np.log10(merged['P_MWU_replica'].clip(lower=1e-300)),
+               alpha=0.6, s=30, color='mediumseagreen')
+    ax.axhline(-np.log10(0.05), color='red', linestyle='--', alpha=0.5)
+    ax.axvline(-np.log10(0.05), color='red', linestyle='--', alpha=0.5)
+    ax.set_xlabel('-log10(P) — naive conformer-level MWU (n=126)', fontsize=13)
+    ax.set_ylabel('-log10(P) — replica-mean MWU (n=18)', fontsize=13)
+    ax.set_title('Naive vs. Replica-Level P-values', fontsize=13)
+    ax.grid(True, alpha=0.3)
+else:
+    ax.axis('off')
+
+plt.tight_layout()
+plt.savefig('KRAS_replica_level_overview.png', dpi=150)
+plt.show()
+
+print("\nDone.")
+print("Output files:")
+print("  KRAS_replica_level_results.xlsx")
+print("  KRAS_all_methods_comparison.xlsx (if other results files available)")
+print("  KRAS_replica_level_overview.png")
