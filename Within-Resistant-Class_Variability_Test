@@ -1,0 +1,313 @@
+"""
+KRAS Within-Resistant-Class Variability Test
+=============================================
+Even though descriptors directly related to
+residue 96 were removed, nearby conformational and solvent-exposure changes
+may still reflect the Y96 substitution rather than a generalizable resistance
+phenotype.
+
+Rationale:
+  If the 6 convergent features track the specific Y96 substitution identity
+  (artefact), then Y96C, Y96D, and Y96S should look DIFFERENT from each other
+  on these features -- because cysteine, aspartate, and serine differ
+  substantially in size, charge, and side-chain chemistry.
+
+  If the features track a shared resistance phenotype, then Y96C, Y96D, and
+  Y96S should look similar to each other on these features, despite differing
+  at residue 96 -- the conformational changes would be consistent regardless
+  of which Y96 substitution is present.
+
+Analysis:
+  1. Kruskal-Wallis test across the 3 resistant mutants (Y96C vs Y96D vs Y96S)
+     for each of the 6 features. Large p = mutants are statistically
+     indistinguishable in central tendency = consistent resistance phenotype.
+  2. Post-hoc Dunn's test (pairwise Mann-Whitney U, BH-FDR corrected) to
+     identify which resistant mutant pairs differ if Kruskal-Wallis is
+     significant.
+  3. Effect size: eta-squared (η²) for within-resistant variability.
+  4. Violin plots for all 6 features across all 4 groups (G12C sensitive +
+     3 resistant mutants).
+
+Features tested (convergent across LMM and replica-mean MWU):
+  LJ-14, RMSF M72, RMSF H95, SASA (AV) H95, SASA (SD) E62, SASA (SD) G10
+
+Encoding: Resistance, 0 = Sensitive, 1 = Resistant
+"""
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.stats import kruskal, mannwhitneyu
+from statsmodels.stats.multitest import multipletests
+from itertools import combinations
+import warnings
+warnings.filterwarnings('ignore')
+
+# =============================================================================
+# 1. LOAD DATA AND EXTRACT LABELS
+# =============================================================================
+
+data = pd.read_excel('KRAS_MD_molecular_descriptors.xlsx')
+
+def extract_system(sample_name):
+    return str(sample_name).split(' ')[0]
+
+data['System'] = data['Sample'].apply(extract_system)
+
+# Clean non-breaking spaces in numeric columns
+exclude_columns = ['Sample', 'Resistance', 'Trajectory frames percentage', 'System']
+feature_cols_all = [c for c in data.columns if c not in exclude_columns]
+
+for c in feature_cols_all:
+    if data[c].dtype == object:
+        data[c] = (data[c].astype(str)
+                   .str.replace('\xa0', '', regex=False)
+                   .str.strip())
+        data[c] = pd.to_numeric(data[c], errors='coerce')
+
+# =============================================================================
+# 2. DEFINE THE 6 CONVERGENT FEATURES AND GROUP LABELS
+# =============================================================================
+
+convergent_features = [
+    'LJ-14',
+    'RMSF res72',
+    'RMSF res95',
+    'SASA res95 av',
+    'SASA res62 sd',
+    'SASA res10 sd'
+]
+
+# Verify all features exist
+for f in convergent_features:
+    if f not in data.columns:
+        print(f"WARNING: '{f}' not found in data columns. Check exact column name.")
+
+# Mutant groups
+sensitive_system = 'G12C'       # label for all G12C-sensitive conformers
+resistant_mutants = ['G12C/Y96C', 'G12C/Y96D', 'G12C/Y96S']
+
+# Assign mutant label: for sensitive, pool all 3 PDB systems as "G12C (sensitive)"
+def assign_mutant(system):
+    if system in ['G12C(6oim)', 'G12C(6ut0)', 'G12C(6mbt)']:
+        return 'G12C\n(sensitive)'
+    return system.replace('G12C/', 'G12C/\n')  # line break for plot readability
+
+data['Mutant_label'] = data['System'].apply(assign_mutant)
+
+# Group order for plots
+group_order = ['G12C\n(sensitive)', 'G12C/\nY96C', 'G12C/\nY96D', 'G12C/\nY96S']
+group_colors = ['#4C9BE8', '#E8754C', '#E8C24C', '#7FBA00']
+
+print("Conformer counts per mutant group:")
+print(data['Mutant_label'].value_counts().to_string())
+print()
+
+# =============================================================================
+# 3. WITHIN-RESISTANT VARIABILITY TEST (KRUSKAL-WALLIS + DUNN'S POST-HOC)
+# =============================================================================
+
+def dunns_test(groups_data, group_names):
+    """
+    Pairwise Mann-Whitney U tests as Dunn's post-hoc, BH-FDR corrected.
+    Returns a DataFrame of pairwise p-values and q-values.
+    """
+    pairs = list(combinations(range(len(group_names)), 2))
+    pairwise = []
+    for i, j in pairs:
+        try:
+            _, p = mannwhitneyu(groups_data[i], groups_data[j], alternative='two-sided')
+        except ValueError:
+            p = np.nan
+        pairwise.append({'Group1': group_names[i], 'Group2': group_names[j], 'P': p})
+
+    pairwise_df = pd.DataFrame(pairwise)
+    valid = ~pairwise_df['P'].isna()
+    if valid.sum() > 0:
+        _, q_vals, _, _ = multipletests(pairwise_df.loc[valid, 'P'], method='fdr_bh')
+        pairwise_df['Q_BH'] = np.nan
+        pairwise_df.loc[valid, 'Q_BH'] = q_vals
+    return pairwise_df
+
+def eta_squared_kruskal(groups_data):
+    """
+    Eta-squared (η²) effect size for Kruskal-Wallis.
+    η² = (H - k + 1) / (n - k), where H = KW statistic, k = n groups, n = total N
+    Range [0, 1]; >0.01 small, >0.06 medium, >0.14 large.
+    """
+    k = len(groups_data)
+    n = sum(len(g) for g in groups_data)
+    try:
+        h_stat, _ = kruskal(*groups_data)
+        eta2 = (h_stat - k + 1) / (n - k)
+        return max(0, eta2)
+    except Exception:
+        return np.nan
+
+results_within = []
+
+print("=" * 80)
+print("WITHIN-RESISTANT KRUSKAL-WALLIS RESULTS")
+print("=" * 80)
+
+for feat in convergent_features:
+
+    # --- Within-resistant groups ---
+    res_groups_data = [
+        data.loc[data['System'] == m, feat].dropna().values
+        for m in resistant_mutants
+    ]
+    res_groups_names = [m.replace('G12C/', '') for m in resistant_mutants]
+
+    try:
+        kw_stat, kw_p = kruskal(*res_groups_data)
+    except Exception:
+        kw_stat, kw_p = np.nan, np.nan
+
+    eta2 = eta_squared_kruskal(res_groups_data)
+
+    # --- Dunn's post-hoc ---
+    dunn = dunns_test(res_groups_data, res_groups_names)
+
+    print(f"\nFeature: {feat}")
+    print(f"  Kruskal-Wallis (within resistant Y96C/D/S): H={kw_stat:.3f}, p={kw_p:.4f}")
+    print(f"  Eta-squared (within-resistant effect size): η²={eta2:.4f}")
+    if kw_p < 0.05:
+        print(f"  -> Significant: resistant mutants differ in central tendency "
+              f"for this feature -- may reflect Y96-substitution-specific effects")
+    else:
+        print(f"  -> Non-significant: resistant mutants are statistically "
+              f"indistinguishable -- supports a shared resistance phenotype")
+    print("  Pairwise post-hoc (BH-FDR):")
+    print(dunn.to_string(index=False))
+
+    results_within.append({
+        'Feature': feat,
+        'KW_statistic': kw_stat,
+        'KW_p_within_resistant': kw_p,
+        'Eta_squared_within_resistant': eta2,
+        'Significant_KW_0.05': kw_p < 0.05 if not np.isnan(kw_p) else None,
+    })
+
+results_df = pd.DataFrame(results_within)
+
+# =============================================================================
+# 4. SAVE SUMMARY TABLE
+# =============================================================================
+
+results_df.to_excel('KRAS_within_resistant_variability.xlsx', index=False)
+print("\nResults saved to KRAS_within_resistant_variability.xlsx")
+
+# =============================================================================
+# 5. VIOLIN PLOTS — all 6 features across 4 groups
+# =============================================================================
+
+fig, axes = plt.subplots(2, 3, figsize=(16, 11))
+axes = axes.flatten()
+
+for idx, feat in enumerate(convergent_features):
+    ax = axes[idx]
+
+    # Collect data per group in display order
+    plot_data = []
+    plot_labels = []
+    for grp in group_order:
+        vals = data.loc[data['Mutant_label'] == grp, feat].dropna().values
+        if len(vals) > 0:
+            plot_data.append(vals)
+            plot_labels.append(grp)
+
+    # Violin plot
+    parts = ax.violinplot(plot_data, positions=range(len(plot_data)),
+                          showmedians=False, showextrema=False)
+
+    for i, pc in enumerate(parts['bodies']):
+        pc.set_facecolor(group_colors[i])
+        pc.set_alpha(0.7)
+        pc.set_edgecolor('black')
+        pc.set_linewidth(0.8)
+
+    # Overlay boxplot for IQR + median
+    bp = ax.boxplot(plot_data, positions=range(len(plot_data)),
+                    widths=0.12, patch_artist=False,
+                    medianprops=dict(color='black', linewidth=2),
+                    whiskerprops=dict(color='black', linewidth=1),
+                    capprops=dict(color='black', linewidth=1),
+                    boxprops=dict(color='black', linewidth=1),
+                    flierprops=dict(marker='o', color='black',
+                                    markersize=3, alpha=0.4))
+
+    ax.set_xticks(range(len(plot_labels)))
+    ax.set_xticklabels(plot_labels, fontsize=13)
+    ax.tick_params(axis='y', labelsize=13)
+    ax.set_title(feat, fontsize=15, fontweight='bold')
+    ax.set_ylabel('Value', fontsize=13)
+    ax.grid(True, axis='y', alpha=0.3)
+
+    # Annotate KW p-value and eta-squared within resistant
+    kw_row = results_df[results_df['Feature'] == feat]
+    if len(kw_row) > 0:
+        kw_p = kw_row['KW_p_within_resistant'].values[0]
+        eta2  = kw_row['Eta_squared_within_resistant'].values[0]
+        ax.text(0.97, 0.97,
+                f"KW p={kw_p:.3f}\nη²={eta2:.3f}",
+                transform=ax.transAxes, fontsize=13,
+                va='top', ha='right',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='white',
+                           edgecolor='gray', alpha=0.8))
+
+    # Vertical separator between sensitive and resistant
+    ax.axvline(0.5, color='black', linestyle='--', linewidth=1.5, alpha=0.4)
+    #ax.text(0.13, 0.02, 'Sensitive', transform=ax.transAxes,
+            #fontsize=13, color='gray', ha='center')
+    #ax.text(0.60, 0.02, 'Resistant mutants', transform=ax.transAxes,
+            #fontsize=13, color='gray', ha='center')
+
+plt.suptitle(
+    'Convergent Features: Distribution Across Sensitive and Resistant Mutants\n'
+    'KW p = Kruskal-Wallis within-resistant (Y96C vs Y96D vs Y96S); '
+    'η² = effect size',
+    fontsize=13, y=1.01
+)
+plt.tight_layout()
+plt.savefig('KRAS_within_resistant_variability.png', dpi=150, bbox_inches='tight')
+plt.show()
+
+print("Violin plot saved to KRAS_within_resistant_variability.png")
+
+# =============================================================================
+# 6. SUMMARY INTERPRETATION
+# =============================================================================
+
+print("\n" + "=" * 80)
+print("INTERPRETATION GUIDE")
+print("=" * 80)
+print("""
+For each feature:
+
+  KW p (Kruskal-Wallis, within resistant Y96C/D/S):
+    HIGH p (>0.05) -> Y96C, Y96D, Y96S are statistically indistinguishable
+                      in central tendency on this feature -> consistent
+                      resistance phenotype, NOT tracking specific Y96
+                      substitution identity
+
+    LOW p (<0.05)  -> Resistant mutants differ from each other on this
+                      feature -> may reflect Y96-substitution-specific
+                      structural effects rather than a generalizable
+                      resistance signal
+
+  η² (eta-squared, within-resistant effect size):
+    <0.06 = small within-resistant differences
+    0.06-0.14 = moderate
+    >0.14 = large (feature varies substantially within resistant class)
+
+  Dunn's post-hoc (pairwise, BH-FDR corrected):
+    Used only when the omnibus Kruskal-Wallis test is significant, to
+    identify which specific pair of resistant mutants (e.g. Y96D vs Y96S)
+    drives the difference.
+""")
+
+print("\nDone.")
+print("Output files:")
+print("  KRAS_within_resistant_variability.xlsx")
+print("  KRAS_within_resistant_variability.png")
